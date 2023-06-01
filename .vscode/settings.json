@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "**/templates/**": "ansible-jinja",
+        "**/*.yml": "ansible"
+    }
+}

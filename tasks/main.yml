@@ -1,0 +1,148 @@
+---
+- name: Check if device exists
+  ansible.builtin.stat:
+    path: "{{ item.device | default('/etc/fstab') }}"
+  register: data_disk__reg_exists
+  loop: "{{ data_disk_devices }}"
+  loop_control:
+    label: "{{ item.device }}"
+
+- name: Fail if device defined is missing
+  ansible.builtin.fail:
+    msg: Block device {{ item.item.device }} not present on {{ inventory_hostname }}
+  when: item.item.device and (item.stat.isblk is not defined or not item.stat.isblk)
+  loop: "{{ data_disk__reg_exists.results }}"
+  loop_control:
+    label: "{{ item.item.device }}"
+
+- name: Create filesystem
+  community.general.filesystem:
+    dev: "{{ item.device }}"
+    fstype: "{{ item.fstype | default(data_disk__fstype) }}"
+    opts: "{{ item.mkfs_opts | default(data_disk__mkfs_opts) }}{{ (item.get('label', '') != '') | ternary(' -L ' ~ item.get('label', ''), '') }}"
+  loop: "{{ data_disk_devices }}"
+  loop_control:
+    label: "{{ item.device }}"
+
+- name: Get device uuid
+  ansible.builtin.command:
+    cmd: lsblk {{ item.device }} -no UUID
+  changed_when: false
+  register: data_disk__reg_uuid
+  when: not data_disk_mount_by_device_name | bool
+  loop: "{{ data_disk_devices }}"
+  loop_control:
+    label: "{{ item.device }}"
+
+- name: Pair device with their uuid
+  ansible.builtin.set_fact:
+    data_disk__fact_uuid: "{{ data_disk__fact_uuid | default([]) + [{'device': item.item.device, 'uuid': item.stdout}] }}"
+  when: not data_disk_mount_by_device_name | bool
+  loop: "{{ data_disk__reg_uuid.results }}"
+  loop_control:
+    label: "{{ item.item.device }}"
+
+- name: Combine data disk devices with uuid
+  ansible.builtin.set_fact:
+    data_disk_devices: "{{ data_disk_devices | community.general.lists_mergeby(data_disk__fact_uuid, 'device') }}"
+  when: not data_disk_mount_by_device_name | bool
+
+- name: Create mount point
+  ansible.builtin.file:
+    state: directory
+    dest: "{{ item.mountpoint | default(data_disk__mount_point) }}"
+    owner: "{{ item.owner | default(omit) }}"
+    group: "{{ item.group | default(omit) }}"
+    mode: "{{ item.mode | default(omit) }}"
+  loop: "{{ data_disk_devices }}"
+  loop_control:
+    label: "{{ item.device }}"
+
+- name: Mount devices
+  ansible.posix.mount:
+    name: "{{ item.mountpoint | default(data_disk__mount_point) }}"
+    src: "{{ (item.get('label', '') != '') | ternary('LABEL=' ~ item.get('label', ''), 'UUID=' ~ item.uuid) }}"
+    fstype: "{{ item.fstype | default(data_disk__fstype) }}"
+    opts: "{{ item.mount_opts | default(data_disk__mount_opts) }}"
+    state: "{{ item.mount_state | default(data_disk_mount_state) }}"
+  when: item.fstype | default(data_disk__fstype) != 'swap' and not data_disk_mount_by_device_name | bool
+  loop: "{{ data_disk_devices }}"
+  loop_control:
+    label: "{{ item.device }}"
+
+- name: Mount devices
+  ansible.posix.mount:
+    name: "{{ item.mountpoint | default(data_disk__mount_point) }}"
+    src: "{{ (item.get('label', '') != '') | ternary('LABEL=' ~ item.get('label', ''), item.device) }}"
+    fstype: "{{ item.fstype | default(data_disk__fstype) }}"
+    opts: "{{ item.mount_opts | default(data_disk__mount_opts) }}"
+    state: "{{ data_disk_mount_state }}"
+  when: item.fstype | default(data_disk__fstype) != 'swap' and data_disk_mount_by_device_name | bool
+  loop: "{{ data_disk_devices }}"
+  loop_control:
+    label: "{{ item.device }}"
+
+- name: Add swap to fstab
+  ansible.posix.mount:
+    name: "{{ item.mountpoint | default(data_disk__mount_point) }}"
+    src: "{{ (item.get('label', '') != '') | ternary('LABEL=' ~ item.get('label', ''), item.device) }}"
+    fstype: swap
+    opts: defaults
+    state: present
+  when: item.fstype | default(data_disk__fstype) == 'swap'
+  notify: Mount swap partition
+  loop: "{{ data_disk_devices }}"
+  loop_control:
+    label: "{{ item.device }}"
+
+- name: Create data source directories
+  ansible.builtin.file:
+    state: directory
+    dest: "{{ item[0].mountpoint | default(data_disk__mount_point) }}/{{ item[1].src }}"
+    owner: "{{ item[1].owner | default(omit) }}"
+    group: "{{ item[1].group | default(omit) }}"
+    mode: "{{ item[1].mode | default(omit) }}"
+    serole: "{{ item[1].serole | default(omit) }}"
+    setype: "{{ item[1].setype | default(omit) }}"
+    seuser: "{{ item[1].seuser | default(omit) }}"
+  with_subelements:
+    - "{{ data_disk_devices | selectattr('mount_binds', 'defined') | list }}"
+    - mount_binds
+  register: data_disk__reg_data_sources
+
+- name: Create data destination directories
+  ansible.builtin.file:
+    state: directory
+    dest: "{{ item[1].dst }}"
+    owner: "{{ item[1].owner | default(omit) }}"
+    group: "{{ item[1].group | default(omit) }}"
+    mode: "{{ item[1].mode | default(omit) }}"
+    serole: "{{ item[1].serole | default(omit) }}"
+    setype: "{{ item[1].setype | default(omit) }}"
+    seuser: "{{ item[1].seuser | default(omit) }}"
+  with_subelements:
+    - "{{ data_disk_devices | selectattr('mount_binds', 'defined') | list }}"
+    - mount_binds
+
+- name: Sync data before binding directories
+  ansible.posix.synchronize:
+    src: "{{ item.item[1].dst }}/"
+    dest: "{{ item.item[0].mount_point | default(data_disk__mount_point) }}/{{ item.item[1].src }}"
+    rsync_opts:
+      - '--hard-links'
+      - '--acls'
+      - '--xattrs'
+  loop: "{{ data_disk__reg_data_sources.results }}"
+  when: item is changed # noqa: no-handler
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: Bind mount directories
+  ansible.posix.mount:
+    name: "{{ item[1].dst }}"
+    src: "{{ item[0].mountpoint | default(data_disk__mount_point) }}/{{ item[1].src }}"
+    opts: bind
+    fstype: none
+    state: mounted
+  with_subelements:
+    - "{{ data_disk_devices | selectattr('mount_binds', 'defined') | list }}"
+    - mount_binds

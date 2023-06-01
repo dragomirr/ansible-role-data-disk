@@ -1,0 +1,5 @@
+---
+data_disk__fstype: ext4
+data_disk__mkfs_opts: '-O dir_index,extent,sparse_super -E lazy_itable_init=0,lazy_journal_init=0,discard'
+data_disk__mount_point: /mnt/data
+data_disk__mount_opts: discard,rw,nobarrier,noquota,noatime,nofail
